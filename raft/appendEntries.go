@@ -3,6 +3,7 @@ package raft
 import (
 	pb "KV-Store/proto"
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -141,6 +142,7 @@ func (rf *Raft) sendHeartBeats() {
 						}
 						if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
 							rf.commitIndex = N
+							fmt.Printf("[Commit] Leader %d committed Index %d\n", rf.me, N)
 							break // Found the highest committed index
 						}
 					}

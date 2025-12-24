@@ -71,7 +71,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, LogEntry{index, term, cmdBytes})
 
 	rf.persist()
-
+	fmt.Printf("[Start] Leader %d received command at Index %d, Term %d\n", rf.me, index, term)
 	//trigger replication
 	//TODO: Optimization
 	go rf.sendHeartBeats()
@@ -125,6 +125,7 @@ func Make(peers []pb.RaftServiceClient, me int, applyCh chan LogEntry) *Raft {
 	rf.lastResetTime = time.Now()
 
 	go rf.ticker()
+	go rf.applier()
 	return rf
 }
 

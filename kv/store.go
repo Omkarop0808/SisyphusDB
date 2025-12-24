@@ -94,6 +94,7 @@ func NewKVStore(peers []pb.RaftServiceClient, me int) (*Store, error) {
 func (s *Store) readAppliedLogs() {
 	for msg := range s.applyCh {
 		// Deserialize
+		fmt.Printf("[Apply] Store applying Index %d. Waiting clients: %d\n", msg.Index, len(s.notifyChans))
 		var cmd raftCmd
 		if err := json.Unmarshal(msg.Command, &cmd); err != nil {
 			fmt.Printf("Error unmarshalling log: %v\n", err)
@@ -110,6 +111,7 @@ func (s *Store) readAppliedLogs() {
 		s.mu.Lock()
 		// We check if any client is waiting for this specific log index
 		if ch, ok := s.notifyChans[msg.Index]; ok {
+			fmt.Printf("[Notify] Notifying client for Index %d\n", msg.Index)
 			ch <- OpResult{
 				Value: cmd.Value,
 				Err:   err,
