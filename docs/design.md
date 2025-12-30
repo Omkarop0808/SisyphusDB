@@ -354,23 +354,269 @@ The interaction between these components creates the durability loop:
 
 The system has evolved into a robust Storage Engine defined by the following structures:
 
-```go
-// The Orchestrator
-type Store struct {
-    activeMap *MemTable          // Phase 4: Mutable write buffer
-    frozenMap *MemTable          // Phase 4: Immutable flush buffer (ready for disk)
-    ssTables  []*sstable.Reader  // Phase 5: Persistent storage (SSTables)
-    walDir    string             
-    sstDir    string             
-    walSeq    int64
-    flushChan chan struct{}      // Phase 5: Trigger for the flush worker
-    mu        sync.RWMutex
+```
+//The Orchestrator
+    type Store struct {
+        activeMap *MemTable          // Phase 4: Mutable write buffer
+        frozenMap *MemTable          // Phase 4: Immutable flush buffer (ready for disk)
+        ssTables  []*sstable.Reader  // Phase 5: Persistent storage (SSTables)
+        walDir    string             
+        sstDir    string             
+        walSeq    int64
+        flushChan chan struct{}      // Phase 5: Trigger for the flush worker
+        mu        sync.RWMutex
+    }
+    
+    // The Component
+    type MemTable struct {
+    Index map[string]int // Phase 3: Sparse Index (Offsets only, no raw data)
+    Arena *arena.Arena // Phase 3: Zero-GC contiguous memory storage
+    size  uint32
+    Wal   *wal.WAL // Phase 4: Dedicated recovery log for this specific table
+    }
+```
+
+### Phase 8: Distributed Consensus (Raft Integration)
+
+With the storage engine (LSM Tree) complete, the next challenge was ensuring data consistency across multiple nodes. I implemented the **Raft Consensus Algorithm** to manage the replication of the write-ahead log.
+
+#### 8.1. The Consensus Module (`raft.go`)
+
+I built the Raft module to act as the "Shared Brain" of the cluster. It manages Leader Election and Log Replication.
+
+Key Optimization: Batched Replication
+
+Instead of sending an RPC for every single Start() call (which would flood the network), I implemented a triggerCh with a micro-sleep. This allows multiple incoming writes to accumulate into a single AppendEntries RPC.
+
+Go
+
+```
+// raft.go
+func (rf *Raft) Start(command interface{}) (int, int, bool) {
+// ... Append to local log ...
+
+    // Non-blocking trigger
+    select {
+    case rf.triggerCh <- struct{}{}:
+    default:
+    }
+    return index, term, true
 }
 
-// The Component
-type MemTable struct {
-    Index map[string]int         // Phase 3: Sparse Index (Offsets only, no raw data)
-    Arena *arena.Arena           // Phase 3: Zero-GC contiguous memory storage
-    size  uint32
-    Wal   *wal.WAL               // Phase 4: Dedicated recovery log for this specific table
+func (rf *Raft) replicator() {
+for {
+select {
+case <-rf.triggerCh:
+// Micro-batching: Wait 30ms to accumulate entries
+time.Sleep(30 * time.Millisecond)
+rf.mu.Lock()
+rf.persist()
+rf.mu.Unlock()
+rf.sendHeartBeats() // Sends ONE RPC with multiple entries
 }
+}
+}
+```
+
+#### 8.2. The Bridge: Raft $\leftrightarrow$ Storage (`kv/store.go`)
+
+The most complex part of this phase was connecting the asynchronous world of Raft (where logs are committed "eventually") with the synchronous world of the Client (who wants an immediate "Success/Fail").
+
+I implemented the **Parallel Worlds Model** using Go channels:
+
+1. **`applyCh` (Raft $\to$ Store):** A buffered channel where Raft pushes logs once a quorum is reached.
+    
+2. **`notifyChans` (Store $\to$ Client):** A map of ephemeral channels waiting for specific log indices.
+    
+
+Go
+
+```
+// kv/store.go
+
+// 1. The Write Path (Client Request)
+func (s *Store) Put(key string, val string, isDelete bool) error {
+// ... Serialize command ...
+index, _, isLeader := s.Raft.Start(cmdBytes)
+
+    // Create a "Parking Spot" channel for this specific index
+    ch := make(chan OpResult, 1)
+    s.mu.Lock()
+    s.notifyChans[index] = ch
+    s.mu.Unlock()
+
+    // BLOCK until Raft commits and the applier wakes us up
+    select {
+    case res := <-ch:
+       return res.Err
+    case <-time.After(2 * time.Second):
+       return fmt.Errorf("timeout")
+    }
+}
+
+// 2. The Apply Loop (Background Worker)
+func (s *Store) readAppliedLogs() {
+for msg := range s.applyCh {
+// Apply to MemTable
+err := s.applyInternal(cmd.Key, cmd.Value, false)
+
+       // Wake up the waiting client
+       s.mu.Lock()
+       if ch, ok := s.notifyChans[msg.Index]; ok {
+          ch <- OpResult{Err: err} // Send signal
+          delete(s.notifyChans, msg.Index)
+       }
+       s.mu.Unlock()
+    }
+}
+```
+
+---
+
+### Phase 9: The RPC Layer (gRPC & Protobuf)
+
+To allow nodes to talk to each other strictly and efficiently, I replaced unstructured HTTP/JSON with **gRPC** and **Protocol Buffers**.
+
+#### 9.1. The Contract (`service.proto`)
+
+Defining the service in Protobuf ensures that all nodes adhere to a strict schema, preventing serialization errors during version upgrades.
+
+Protocol Buffers
+
+```
+syntax = "proto3";
+package proto;
+
+service RaftService {
+// Leader Election
+rpc RequestVote (RequestVoteRequest) returns (RequestVoteResponse);
+// Log Replication & Heartbeats
+rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
+}
+
+message LogEntry {
+int32 term = 1;
+int32 index = 2;
+bytes command = 3; // The actual KV operation
+}
+```
+
+This binary protocol is significantly smaller and faster to parse than JSON, reducing CPU usage during high-throughput replication.
+
+---
+
+### Phase 10: Containerization (Docker)
+
+To ensure the system runs identically on a developer's laptop and a production cluster, I containerized the application using a **Multi-Stage Build**.
+
+#### 10.1. The Dockerfile Strategy
+
+1. **Builder Stage:** Uses the heavy `golang:1.25-alpine` image to compile the code. I used `CGO_ENABLED=0` to create a static binary that doesn't depend on system C libraries.
+    
+2. **Runner Stage:** Copies _only_ the binary to a tiny `alpine:latest` image. This reduces the final image size from ~1GB to <50MB.
+    
+
+Dockerfile
+
+```
+# --- Stage 1: Builder ---
+FROM golang:1.25-alpine AS builder
+WORKDIR /app
+COPY . .
+# Static compilation
+RUN CGO_ENABLED=0 GOOS=linux go build -o kv-server cmd/server/main.go
+
+# --- Stage 2: Runner ---
+FROM alpine:latest
+WORKDIR /root/
+COPY --from=builder /app/kv-server .
+# Create persistence directories
+RUN mkdir -p Storage/wal Storage/data
+ENTRYPOINT ["./kv-server"]
+```
+
+---
+
+### Phase 11: Orchestration (Kubernetes)
+
+Running a distributed stateful system requires stable network identities. I utilized Kubernetes **StatefulSets** to achieve this.
+
+#### 11.1. Network Identity (Headless Service)
+
+Standard K8s Services load balance traffic (Round Robin). This is bad for Raft, because Node 0 _needs_ to talk specifically to Node 1, not "any random node."
+
+I used a **Headless Service** (`clusterIP: None`), which creates direct DNS records for each pod: `kv-0.kv-raft`, `kv-1.kv-raft`, etc.
+
+YAML
+
+```
+# service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+name: kv-raft
+spec:
+clusterIP: None # Headless: exposes individual pod IPs
+selector:
+app: SisyphusDB
+```
+
+#### 11.2. Stable Storage (StatefulSet)
+
+The `StatefulSet` ensures that if `kv-0` crashes and restarts:
+
+1. It keeps the name `kv-0` (Stable Network ID).
+    
+2. It re-attaches to the _exact same_ Persistent Volume (Stable Storage).
+    
+
+YAML
+
+```
+# statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+name: kv
+spec:
+serviceName: "kv-raft"
+replicas: 3
+template:
+spec:
+containers:
+- name: kv-server
+# The boot command dynamically determines ID from hostname (kv-0 -> 0)
+command: ["/bin/sh", "-c"]
+args:
+- >
+export ID=${HOSTNAME##*-};
+./kv-server -id $ID -peers kv-0.kv-raft:5001,kv-1.kv-raft:5001...
+```
+
+---
+
+### Phase 12: Performance Verification
+
+Once deployed, the system was subjected to load testing to verify the architecture's claims.
+
+#### 12.1. Methodology
+
+- **Tool:** Vegeta (HTTP Load Testing).
+    
+- **Environment:** 3-Node Kubernetes Cluster (Minikube).
+    
+- **Scenario:** 100% Write workload to trigger Raft replication and LSM flushing.
+    
+
+#### 12.2. Results
+
+The batched replication (Phase 8) and Arena allocation (Phase 3) combined to deliver high throughput with stable latency.
+
+- **Throughput:** ~2,000 Writes/Second.
+    
+- **Latency:** ~32ms mean latency (network + consensus + disk write).
+    
+- **Consistency:** Zero data loss during forced pod deletion (Chaos Test), verified by the WAL recovery logic (Phase 2).
+    
+
+This implementation journey—from a simple map to a Kubernetes-native distributed database—demonstrates the layers of complexity required to build production-grade systems: **Memory Safety**, **Disk Durability**, **Network Consensus**, and **Infrastructure Orchestration**.
