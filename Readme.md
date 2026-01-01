@@ -1,19 +1,125 @@
 # SisyphusDB: Distributed Key-Value Store
 
-SisyphusDB is a high-performance, distributed key-value store engineered for strong consistency (CP system) and high write throughput. It implements a Log-Structured Merge (LSM) Tree storage engine and utilizes the Raft consensus algorithm to manage replication across a coordinated fleet of nodes.
+SisyphusDB is a high-performance distributed database designed for strong consistency and high availability. It leverages modern distributed system patterns to ensure data reliability and speed.
+
+A distributed key-value store engineered for strong consistency and high availability, capable of handling **2,000+ RPS** with **<35ms latency**.
+
+- **Core Consensus (Raft):**
+    
+    - Implements a custom Raft consensus engine with **batched RPCs** and term-based backtracking.
+        
+    - Ensures linearizability and fast leader recovery (**<550ms**) during network partitions. [Results](docs/benchmarks/recovery_log.csv)
+        
+- **Storage Engine (LSM-Tree):**
+    
+    - Uses **Level-Tiered SSTables** for optimized write throughput.
+        
+    - Integrated **Bloom Filters** (1% False-Positive rate) reduce disk lookups for non-existent keys by **95%**. [Industry-standard]
+        
+- **Performance Engineering:**
+    
+    - **Zero-Allocation Arena Allocator:** Replaced standard Go maps to eliminate Garbage Collection (GC) overhead in the write path.
+        
+    - **Optimization:** Reduced write operation latency by **71% (82ns → 23ns)**, verified using **pprof** profiling. [Results](https://github.com/awhvish/SisyphusDB/tree/master/docs/benchmarks/arena)
+        
+- **Infrastructure & Observability:**
+    
+    - **Kubernetes Native:** Deployed using **StatefulSets** and **PersistentVolumeClaims (PVCs)** to ensure zero data loss during restarts.
+        
+    - **Monitoring:** Full observability pipeline established with **Prometheus** and **Grafana** for tracking metrics like replication lag.
+        
+    - **Testing:** System stability and performance verified via **Vegeta** load testing.
 
 This project demonstrates the architectural evolution from a simple in-memory map to a fault-tolerant distributed system capable of handling production-grade workloads.
 
 ---
 
-
-##
-You can install locally, in dockerized containers or K8s clusters.
-[A detailed guide](/INSTALL.md)
-
 ## System Architecture
 
-<img src="docs/high_level_architecture.png" alt="Architecture" width="60%" height="50%">
+```mermaid
+   flowchart TD
+    %% Global Styles
+    classDef cluster fill:#f9f9f9,stroke:#333,stroke-width:2px;
+    classDef component fill:#fff,stroke:#333,stroke-width:1px;
+    classDef storage fill:#e1f5fe,stroke:#0277bd,stroke-width:2px;
+    classDef logic fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+
+    Client([Client Request]) -->|TCP/HTTP| K8s[K8s Service / StatefulSet LB]
+
+    subgraph K8s_Cluster [Kubernetes Cluster]
+        direction TB
+        
+        %% Node Selection Logic
+        K8s -->|Route Request| NodeSelector{Check Role}
+        
+        %% Follower Logic
+        NodeSelector -->|If Follower| Follower[Raft Follower Node]
+        Follower -.->|Forward Request| Leader[Raft Leader Node]
+        
+        %% Leader Logic
+        NodeSelector -->|If Leader| Leader
+        
+        subgraph Leader_Node [Leader Node Internals]
+            direction TB
+            
+            %% Raft Consensus Layer
+            subgraph Raft_Layer [Raft Consensus Layer]
+                RLog[("Raft Log")]
+                RPC[Batched RPC Sender]
+                
+                Leader -->|Write Request| RLog
+                RLog -->|Micro-batch AppendEntries| RPC
+                RPC ==>|Replicate Log| Follower
+            end
+
+            %% Transition to Storage
+            RLog -->|Commit Msg| Channel{Go Channel}
+            Channel -->|Wait for Signal| ApplyInt[go applyInternal]
+            
+            %% Storage Engine Layer
+            subgraph Storage_Engine [LSM Storage Engine]
+                direction TB
+                
+                %% Memory Components
+                subgraph Memory [Memory / Arena Allocator]
+                    ActiveMap["Active Map (MemTable)"]
+                    FrozenMap["Frozen Map (Immutable)"]
+                    Arena[Custom Arena Allocator]
+                    
+                    Arena -.->|Backs Memory| ActiveMap
+                    Arena -.->|Backs Memory| FrozenMap
+                end
+                
+                %% Disk Components
+                subgraph Disk [Disk / SSTables]
+                    Bloom[Bloom Filters]
+                    L0[Level 0 SSTables]
+                    L1[Level 1 SSTables]
+                    L2[Level 2+ SSTables]
+                    Compaction["Compaction Worker (Max 4 Nodes/Level)"]
+                    
+                    L0 --> L1 --> L2
+                    Compaction -->|Recursive Merge| L0
+                end
+            end
+            
+            %% Write Path Connections
+            ApplyInt -->|Put/Delete/Tombstone| ActiveMap
+            ActiveMap -->|Flush| FrozenMap
+            FrozenMap -->|Flush| L0
+            
+            %% Read Path Connections
+            Leader -.->|Read Request| ActiveMap
+            ActiveMap -.->|Miss| FrozenMap
+            FrozenMap -.->|Miss| Bloom
+            Bloom -.->|Check Exists| L0
+        end
+    end
+
+    %% Legend
+    class ActiveMap,FrozenMap,Arena storage;
+    class ApplyInt,Compaction logic;
+```
 
 The architecture is composed of three distinct layers, separating network communication, consensus logic, and physical storage.
 A detailed explaination: [HERE](docs/ARCHITECHTURE.md)
@@ -212,6 +318,10 @@ kubectl port-forward service/prometheus 9090:9090
 - **Raft State:** Tracks the current role of each node (0=Follower, 1=Candidate, 2=Leader).
 
 - **Replication Lag:** Detects if followers are falling behind the leader's log index.
+
+## INSTALL
+You can install locally, in dockerized containers or K8s clusters.
+[A detailed guide](/INSTALL.md)
 
 
 ## Feature Implementation Status
