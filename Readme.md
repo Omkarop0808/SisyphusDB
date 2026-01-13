@@ -324,18 +324,4 @@ You can install locally, in dockerized containers or K8s clusters.
 [A detailed guide](/INSTALL.md)
 
 
-## Feature Implementation Status
 
-The feature set targets distributed systems complexity comparable to senior-level engineering requirements.
-
-| **Feature**                        |**Technical Justification**|**Status**|
-|------------------------------------|---|---|
-| **LSM Tree Storage**               |High-throughput write engine (vs. B-Trees).|✅ Done|
-| **Arena Allocator**                |Zero-allocation memory management.|✅ Done|
-| **WAL & Crash Recovery**           |Durability via `fsync` and replay logic.|✅ Done|
-| **SSTables + Sparse Index**        |Optimized disk I/O and binary search.|✅ Done|
-| **Bloom Filters**                  |Probabilistic structures to minimize disk reads.|✅ Done|
-| **Leveled Compaction**             |Mitigation of Write/Read Amplification.|✅ Done|
-| **Raft Consensus**                 |Distributed consistency (CAP Theorem compliance).|✅ Done|
-| **gRPC & Protobuf**                |Schema-strict internal communication.|✅ Done|
-| **Prometheus Metrics and Grafana** |System observability and telemetry.|✅ Done|
