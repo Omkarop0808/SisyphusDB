@@ -14,6 +14,7 @@
   <a href="#architecture">Architecture</a> •
   <a href="#benchmarks">Benchmarks</a> •
   <a href="#chaos-testing">Chaos Testing</a>
+  <a href="https://github.com/awhvish/SisyphusDB/blob/master/docs/aws_deployment.png">EKS DeploymentProof</a>
 </p>
 
 ---
