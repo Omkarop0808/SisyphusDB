@@ -151,22 +151,21 @@ func Make(peers []pb.RaftServiceClient, me int, applyCh chan LogEntry) *Raft {
 	go rf.replicator()
 	return rf
 }
-func (rf *Raft) replicator() {
-	for range rf.triggerCh {
-		// Drain-loop based accumulation of log entries
-		drain:
-		for {
-			select {
-			case <-rf.triggerCh:
-			default: 
-				break drain
-			}
-		}
 
-		rf.mu.Lock()
-		rf.persist()
-		rf.mu.Unlock()
-		rf.sendHeartBeats()
+func (rf *Raft) replicator() {
+	for {
+		select {
+		case <-rf.triggerCh:
+			// Instead of sending immediately, we sleep for 5ms.
+			// This allows multiple 'Start()' calls to pile up entries in rf.log.
+			time.Sleep(5 * time.Millisecond)
+
+			rf.mu.Lock()
+			rf.persist()
+			rf.mu.Unlock()
+			// Now we send ONE RPC containing ALL the new entries
+			rf.sendHeartBeats()
+		}
 	}
 }
 
@@ -208,8 +207,6 @@ func (rf *Raft) startElection() {
 	votesReceived := 1 // Vote for self
 	votesRequired := len(rf.peers)/2 + 1
 
-	fmt.Printf("Node %d starting election for term %d\n", rf.me, term)
-
 	for i := range rf.peers {
 		go func(peerIndex int) {
 			args := RequestVoteArgs{
@@ -241,7 +238,6 @@ func (rf *Raft) startElection() {
 				if reply.VoteGranted {
 					votesReceived++
 					if votesReceived == votesRequired {
-						fmt.Printf("Node %d won election and will be leader for the term: %d\n", rf.me, reply.Term)
 						rf.state = Leader
 						rf.leaderId = rf.me
 						for p := range rf.peers {
@@ -272,16 +268,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 	pbReply, err := rf.peers[server].RequestVote(ctx, pbArgs)
 	if err != nil {
-		fmt.Printf(" [ERROR] Node %d failed to request vote from Node %d: %v\n", rf.me, server, err)
 		return false
 	}
 	reply.Term = int(pbReply.Term)
 	reply.VoteGranted = pbReply.VoteGranted
-	if !reply.VoteGranted {
-		fmt.Printf(" [DENIED] Node %d refused vote to Node %d. (My Term: %d, Peer Term: %d)\n", server, rf.me, args.Term, reply.Term)
-	} else {
-		fmt.Printf(" [GRANTED] Node %d voted for Node %d!\n", server, rf.me)
-	}
 	return true
 }
 
